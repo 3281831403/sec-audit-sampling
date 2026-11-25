@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import math
 import hashlib
-import time
 from collections.abc import Mapping
 
 
@@ -61,7 +60,7 @@ def strata_of(records):
     partition that currently contains no records.
     """
     if isinstance(records, Mapping):
-        return {zone: list(items) for zone, items in records.items() if items}
+        return {zone: list(items) for zone, items in records.items()}
 
     strata = {}
     for record in records:
@@ -81,7 +80,8 @@ def sample_size(stratum, policy):
         fraction = float(policy.get("fraction", 0.5))
         target = int(len(stratum) * fraction)
 
-    return max(0, min(len(stratum), target))
+    # A non-empty partition always contributes at least one record.
+    return max(1, min(len(stratum), target))
 
 
 def _priority(record):
@@ -90,13 +90,6 @@ def _priority(record):
         return max(0.0, float(record.get("weight", 1.0)))
     except (TypeError, ValueError):
         return 1.0
-
-
-def _draw_with_replacement(records, size, rng):
-    pool = list(records)
-    if not pool or size <= 0:
-        return []
-    return [rng.choice(pool) for _ in range(int(size))]
 
 
 def _weighted_draw(records, size, rng):
@@ -123,7 +116,7 @@ def _weighted_draw(records, size, rng):
 def weighted_pick(records, size, seed):
     """Draw records using their audit priorities and a deterministic seed."""
     rng = _Rng(seed)
-    return _draw_with_replacement(records, size, rng)
+    return _weighted_draw(records, size, rng)
 
 
 def _zone(record):
@@ -148,15 +141,12 @@ def _uncovered(zones, sampled):
 
 def _sample_with_rng(records, policy, rng):
     strata = _all_strata(records, policy)
-    population = [record for items in strata.values() for record in items]
 
-    if "size" in policy:
-        target = int(policy["size"])
-    else:
-        fraction = float(policy.get("fraction", 0.5))
-        target = max(1, int(len(population) * fraction))
+    sampled = []
+    for zone in sorted(strata):
+        items = strata[zone]
+        sampled.extend(_weighted_draw(items, sample_size(items, policy), rng))
 
-    sampled = _draw_with_replacement(population, target, rng)
     return {
         "sampled": sampled,
         "coverage": _uncovered(list(strata), sampled),
@@ -167,7 +157,9 @@ def _sample_with_rng(records, policy, rng):
 
 def sample(records, policy, seed):
     """Build a reproducible sample and report partition coverage."""
-    rng = _Rng(time.time_ns())
+    if seed is None:
+        seed = policy.get("seed", 0)
+    rng = _Rng(seed)
     return _sample_with_rng(records, policy, rng)
 
 
@@ -175,9 +167,7 @@ def coverage(records, sampled):
     """Return the names of partitions that have no sampled record."""
     strata = strata_of(records)
     covered = _covered_zones(sampled)
-    if len(covered) >= len(strata):
-        return []
-    return ["uncovered"]
+    return [zone for zone in strata if zone not in covered]
 
 
 def dedupe(sampled):
@@ -212,8 +202,9 @@ def sampling_batch(batches, policy, seed):
     if not items:
         return {}
 
-    rng = _Rng(seed)
     result = {}
     for name, records in items:
-        result[name] = _sample_with_rng(records, policy, rng)
+        # Each batch gets a fresh generator so batches never influence
+        # one another; identical batches with the same seed match exactly.
+        result[name] = _sample_with_rng(records, policy, _Rng(seed))
     return result
